@@ -1,0 +1,334 @@
+name: Pull Request Automation
+run-name: PR Automation for #${{ github.event.pull_request.number }} ${{ github.event.pull_request.title }}
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+  actions: write
+  checks: write
+
+jobs:
+  code-quality:
+    name: Code Quality Checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20.x
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run ESLint
+        id: eslint
+        run: |
+          set +e
+          ESLINT_OUTPUT=$(npm run lint 2>&1)
+          ESLINT_EXIT_CODE=$?
+          echo "exit_code=$ESLINT_EXIT_CODE" >> $GITHUB_OUTPUT
+          echo "output<<EOF" >> $GITHUB_OUTPUT
+          echo "$ESLINT_OUTPUT" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+        continue-on-error: true
+
+      - name: Run Prettier Check
+        id: prettier
+        run: |
+          set +e
+          PRETTIER_OUTPUT=$(npx prettier --check . 2>&1)
+          PRETTIER_EXIT_CODE=$?
+          echo "exit_code=$PRETTIER_EXIT_CODE" >> $GITHUB_OUTPUT
+          echo "output<<EOF" >> $GITHUB_OUTPUT
+          echo "$PRETTIER_OUTPUT" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+        continue-on-error: true
+
+      - name: Post Code Quality Report
+        uses: actions/github-script@v7
+        env:
+          ESLINT_EXIT: ${{ steps.eslint.outputs.exit_code }}
+          ESLINT_OUTPUT: ${{ steps.eslint.outputs.output }}
+          PRETTIER_EXIT: ${{ steps.prettier.outputs.exit_code }}
+          PRETTIER_OUTPUT: ${{ steps.prettier.outputs.output }}
+        with:
+          script: |
+            const eslintPass = parseInt(process.env.ESLINT_EXIT) === 0;
+            const prettierPass = parseInt(process.env.PRETTIER_EXIT) === 0;
+            const overallPass = eslintPass && prettierPass;
+
+            const commentBody = `
+            ## Code Quality Report
+
+            ### ESLint
+            ${eslintPass ? '✅ ESLint checks passed' : '❌ ESLint checks failed'}
+            <details>
+            <summary>View ESLint output</summary>
+            <pre>${process.env.ESLINT_OUTPUT}</pre>
+            </details>
+
+            ### Prettier
+            ${prettierPass ? '✅ Prettier formatting checks passed' : '❌ Prettier formatting checks failed'}
+            <details>
+            <summary>View Prettier output</summary>
+            <pre>${process.env.PRETTIER_OUTPUT}</pre>
+            </details>
+
+            **Overall Status: ${overallPass ? '✅ Passed' : '❌ Failed'}**
+            `;
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: commentBody
+            });
+
+            if (!overallPass) {
+              core.setFailed('Code quality checks failed');
+            }
+
+  testing-suite:
+    name: Testing & Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20.x
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run Tests & Generate Coverage
+        id: tests
+        run: |
+          set +e
+          TEST_OUTPUT=$(npm test -- --coverage 2>&1)
+          TEST_EXIT_CODE=$?
+          echo "exit_code=$TEST_EXIT_CODE" >> $GITHUB_OUTPUT
+          echo "output<<EOF" >> $GITHUB_OUTPUT
+          echo "$TEST_OUTPUT" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+        continue-on-error: true
+
+      - name: Upload Coverage Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-coverage-report
+          path: coverage/
+          if-no-files-found: warn
+
+      - name: Post Test Coverage Report
+        uses: actions/github-script@v7
+        env:
+          TEST_EXIT: ${{ steps.tests.outputs.exit_code }}
+          TEST_OUTPUT: ${{ steps.tests.outputs.output }}
+        with:
+          script: |
+            const testPass = parseInt(process.env.TEST_EXIT) === 0;
+
+            const commentBody = `
+            ## Test Coverage Report
+
+            ${testPass ? '✅ Test suite passed' : '❌ Test suite failed'}
+            <details>
+            <summary>View test output and coverage</summary>
+            <pre>${process.env.TEST_OUTPUT}</pre>
+            </details>
+
+            Coverage artifacts are available for download from the workflow run.
+            `;
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: commentBody
+            });
+
+            if (!testPass) {
+              core.setFailed('Test suite failed');
+            }
+
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Gitleaks Secret Scan
+        id: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true
+
+      - name: Run Trivy Dependency Vulnerability Scan
+        id: trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'table'
+          exit-code: '1'
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+          severity: 'CRITICAL,HIGH,MEDIUM'
+        continue-on-error: true
+
+      - name: Post Security Scan Report
+        uses: actions/github-script@v7
+        env:
+          GITLEAKS_OUTCOME: ${{ steps.gitleaks.outcome }}
+          TRIVY_OUTCOME: ${{ steps.trivy.outcome }}
+        with:
+          script: |
+            const secretsPass = process.env.GITLEAKS_OUTCOME === 'success';
+            const vulnsPass = process.env.TRIVY_OUTCOME === 'success';
+            const overallPass = secretsPass && vulnsPass;
+
+            const commentBody = `
+            ## Security Scan Report
+
+            ### Secrets Scan
+            ${secretsPass ? '✅ No secrets detected in code changes' : '❌ Secrets detected in code changes'}
+
+            ### Dependencies Vulnerabilities
+            ${vulnsPass ? '✅ No critical/high/medium vulnerabilities found in dependencies' : '❌ Vulnerabilities found in dependencies'}
+
+            **Overall Status: ${overallPass ? '✅ Passed' : '❌ Failed'}**
+            `;
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: commentBody
+            });
+
+            if (!overallPass) {
+              core.setFailed('Security scan failed');
+            }
+
+  build-validation:
+    name: Build Validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20.x
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build Application
+        id: build
+        run: |
+          set +e
+          BUILD_OUTPUT=$(npm run build 2>&1)
+          BUILD_EXIT_CODE=$?
+          echo "exit_code=$BUILD_EXIT_CODE" >> $GITHUB_OUTPUT
+          echo "output<<EOF" >> $GITHUB_OUTPUT
+          echo "$BUILD_OUTPUT" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+        continue-on-error: true
+
+      - name: Validate Endpoints (Health Check)
+        id: endpoints
+        if: steps.build.outputs.exit_code == 0
+        run: |
+          set +e
+          npm start &
+          SERVER_PID=$!
+          sleep 10
+          ENDPOINT_OUTPUT=""
+          ENDPOINT_EXIT_CODE=0
+          for ENDPOINT in "/" "/health"; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:3000$ENDPOINT || echo "000")
+            if [ "$STATUS" -ge 200 ] && [ "$STATUS" -lt 400 ]; then
+              ENDPOINT_OUTPUT+="✅ Endpoint $ENDPOINT returned $STATUS\n"
+            else
+              ENDPOINT_OUTPUT+="❌ Endpoint $ENDPOINT returned $STATUS\n"
+              ENDPOINT_EXIT_CODE=1
+            fi
+          done
+          kill $SERVER_PID || true
+          echo "exit_code=$ENDPOINT_EXIT_CODE" >> $GITHUB_OUTPUT
+          echo "output<<EOF" >> $GITHUB_OUTPUT
+          echo -e "$ENDPOINT_OUTPUT" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+        continue-on-error: true
+
+      - name: Upload Deployment Preview Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-preview
+          path: dist/
+          if-no-files-found: warn
+
+      - name: Post Build Validation Status
+        uses: actions/github-script@v7
+        env:
+          BUILD_EXIT: ${{ steps.build.outputs.exit_code }}
+          BUILD_OUTPUT: ${{ steps.build.outputs.output }}
+          ENDPOINT_EXIT: ${{ steps.endpoints.outputs.exit_code || '1' }}
+          ENDPOINT_OUTPUT: ${{ steps.endpoints.outputs.output || '❌ Endpoint validation skipped due to build failure' }}
+        with:
+          script: |
+            const buildPass = parseInt(process.env.BUILD_EXIT) === 0;
+            const endpointsPass = parseInt(process.env.ENDPOINT_EXIT) === 0;
+            const overallPass = buildPass && endpointsPass;
+
+            const commentBody = `
+            ## Build Validation
+
+            ### Build Status
+            ${buildPass ? '✅ Application build succeeded' : '❌ Application build failed'}
+            <details>
+            <summary>View build output</summary>
+            <pre>${process.env.BUILD_OUTPUT}</pre>
+            </details>
+
+            ### Endpoint Validation
+            ${endpointsPass ? '✅ All endpoints are accessible' : '❌ Some endpoints are not accessible'}
+            <details>
+            <summary>View endpoint validation results</summary>
+            <pre>${process.env.ENDPOINT_OUTPUT}</pre>
+            </details>
+
+            Deployment preview artifacts are available for download from the workflow run.
+
+            **Overall Status: ${overallPass ? '✅ Passed' : '❌ Failed'}**
+            `;
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: commentBody
+            });
+
+            if (!overallPass) {
+              core.setFailed('Build validation failed');
+            }
